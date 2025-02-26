@@ -1,176 +1,165 @@
-"""
-Donut
-Copyright (c) 2022-present NAVER Corp.
-MIT License
-"""
-import argparse
-import datetime
-import json
-import os
-import random
-from io import BytesIO
-from os.path import basename
-from pathlib import Path
-
-import numpy as np
-import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
-from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
-from pytorch_lightning.plugins import CheckpointIO
-from pytorch_lightning.utilities import rank_zero_only
-from sconf import Config
+from torch.utils.data import DataLoader
+import numpy as np
+import random
+import os
+from pathlib import Path
+import re
+from nltk import edit_distance
+from tqdm import tqdm 
 
-from donut import DonutDataset
-from lightning_module import DonutDataPLModule, DonutModelPLModule
+from transformers import VisionEncoderDecoderConfig, DonutProcessor, VisionEncoderDecoderModel
 
+from donut_dataset import DonutDataset
 
-class CustomCheckpointIO(CheckpointIO):
-    def save_checkpoint(self, checkpoint, path, storage_options=None):
-        del checkpoint["state_dict"]
-        torch.save(checkpoint, path)
+import datetime
 
-    def load_checkpoint(self, path, storage_options=None):
-        checkpoint = torch.load(path + "artifacts.ckpt")
-        state_dict = torch.load(path + "pytorch_model.bin")
-        checkpoint["state_dict"] = {"model." + key: value for key, value in state_dict.items()}
-        return checkpoint
+MODEL_TOKEN_START = "<ocr_pck>"
+MODEL_TOKEN_END = '<ocr_pck/>'
 
-    def remove_checkpoint(self, path) -> None:
-        return super().remove_checkpoint(path)
-
-
-@rank_zero_only
-def save_config_file(config, path):
-    if not Path(path).exists():
-        os.makedirs(path)
-    save_path = Path(path) / "config.yaml"
-    print(config.dumps())
-    with open(save_path, "w") as f:
-        f.write(config.dumps(modified_color=None, quote_str=True))
-        print(f"Config is saved at {save_path}")
-
-
-class ProgressBar(pl.callbacks.TQDMProgressBar):
-    def __init__(self, config):
-        super().__init__()
-        self.enable = True
-        self.config = config
-
-    def disable(self):
-        self.enable = False
-
-    def get_metrics(self, trainer, model):
-        items = super().get_metrics(trainer, model)
-        items.pop("v_num", None)
-        items["exp_name"] = f"{self.config.get('exp_name', '')}"
-        items["exp_version"] = f"{self.config.get('exp_version', '')}"
-        return items
-
-
-def set_seed(seed):
-    pytorch_lightning_version = int(pl.__version__[0])
-    if pytorch_lightning_version < 2:
-        pl.utilities.seed.seed_everything(seed, workers=True)
-    else:
-        import lightning_fabric
-        lightning_fabric.utilities.seed.seed_everything(seed, workers=True)
+def compute_edit_distance(pred, answer):
+    pred = re.sub(r"(?:(?<=>) | (?=</s_))", "", pred)
+    answer = re.sub(r"<.*?>", "", answer, count=1).replace("</s>", "")
+    return edit_distance(pred, answer) / max(len(pred), len(answer))
 
 
 def train(config):
-    set_seed(config.get("seed", 42))
 
-    model_module = DonutModelPLModule(config)
-    data_module = DonutDataPLModule(config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # add datasets to data_module
-    datasets = {"train": [], "validation": []}
-    for i, dataset_name_or_path in enumerate(config.dataset_name_or_paths):
-        task_name = os.path.basename(dataset_name_or_path)  # e.g., cord-v2, docvqa, rvlcdip, ...
+    donut_config = VisionEncoderDecoderConfig.from_pretrained(config["pretrained_model_name_or_path"])
+    donut_config.encoder.image_size = config["input_size"]
+    donut_config.decoder.max_length = config["max_length"]
+
+    processor = DonutProcessor.from_pretrained(config["pretrained_model_name_or_path"])
+    model = VisionEncoderDecoderModel.from_pretrained(config["pretrained_model_name_or_path"], config=donut_config).to(device)
+
+    processor.image_processor.size = config["input_size"][::-1]
+    processor.image_processor.do_align_long_axis = False
+
+    datasets = {}
+    
+    task_name = config["task_name"]
+
+    print("I", datetime.datetime.now().time())
+
+    for split in ["train", "validation"]:
+
+        print("I - a", datetime.datetime.now().time())
+        datasets[split] = DonutDataset(
+            model,
+            processor,
+            config["dataset_name_or_path"] + '/' + split,
+            max_length=config["max_length"],
+            task_start_token=MODEL_TOKEN_START,
+            prompt_end_token=MODEL_TOKEN_END,
+            sort_json_key=False
+        )
+    
+    print("II", datetime.datetime.now().time())
+
+    model.config.pad_token_id = processor.tokenizer.pad_token_id
+    model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids([MODEL_TOKEN_START])[0]
+
+    train_loader = DataLoader(datasets["train"], batch_size=config["batch_size"], shuffle=True)
+    val_loader = DataLoader(datasets["validation"], batch_size=config["batch_size"], shuffle=False)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+
+    result_path = Path(config["result_path"])
+    result_path.mkdir(parents=True, exist_ok=True)
+
+    best_val_loss = float("inf")
+
+    print("III", datetime.datetime.now().time())
         
-        # add categorical special tokens (optional)
-        if task_name == "rvlcdip":
-            model_module.model.decoder.add_special_tokens([
-                "<advertisement/>", "<budget/>", "<email/>", "<file_folder/>", 
-                "<form/>", "<handwritten/>", "<invoice/>", "<letter/>", 
-                "<memo/>", "<news_article/>", "<presentation/>", "<questionnaire/>", 
-                "<resume/>", "<scientific_publication/>", "<scientific_report/>", "<specification/>"
-            ])
-        if task_name == "docvqa":
-            model_module.model.decoder.add_special_tokens(["<yes/>", "<no/>"])
+    for epoch in range(config["max_epochs"]):
+        # --- TRAINING ---
+        model.train()
+        train_loss = 0
+        xd = 0
+        for pixel_values, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['max_epochs']} - Training"):
+            pixel_values, labels = pixel_values.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+
+            loss = model(pixel_values, labels=labels).loss
+            loss.backward()
+            optimizer.step()
             
-        for split in ["train", "validation"]:
-            datasets[split].append(
-                DonutDataset(
-                    dataset_name_or_path=dataset_name_or_path,
-                    donut_model=model_module.model,
-                    max_length=config.max_length,
-                    split=split,
-                    task_start_token=config.task_start_tokens[i]
-                    if config.get("task_start_tokens", None)
-                    else f"<s_{task_name}>",
-                    prompt_end_token="<s_answer>" if "docvqa" in dataset_name_or_path else f"<s_{task_name}>",
-                    sort_json_key=config.sort_json_key,
-                )
-            )
-            # prompt_end_token is used for ignoring a given prompt in a loss function
-            # for docvqa task, i.e., {"question": {used as a prompt}, "answer": {prediction target}},
-            # set prompt_end_token to "<s_answer>"
-    data_module.train_datasets = datasets["train"]
-    data_module.val_datasets = datasets["validation"]
+            train_loss += loss.item()
+            xd += 1
+            if xd == 10:
+                break # TESTING LOOP
+        
+        train_loss /= len(train_loader)
+        print(f"Epoch {epoch+1}/{config['max_epochs']} - Train Loss: {train_loss:.4f}")
 
-    logger = TensorBoardLogger(
-        save_dir=config.result_path,
-        name=config.exp_name,
-        version=config.exp_version,
-        default_hp_metric=False,
-    )
+        print("IV", datetime.datetime.now().time())
+        # --- VALIDATION ---
+        model.eval()
+        val_loss = 0
+        val_scores = []
+        xd = 0
+        with torch.no_grad():
+            for pixel_values, labels, answers in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['max_epochs']} - Validation"):
+                pixel_values, labels = pixel_values.to(device), labels.to(device)
+                batch_size = pixel_values.shape[0]
 
-    lr_callback = LearningRateMonitor(logging_interval="step")
+                decoder_input_ids = torch.full((batch_size, 1), model.config.decoder_start_token_id, device=device)
 
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_metric",
-        dirpath=Path(config.result_path) / config.exp_name / config.exp_version,
-        filename="artifacts",
-        save_top_k=1,
-        save_last=False,
-        mode="min",
-    )
+                outputs = model.generate(pixel_values,
+                                        decoder_input_ids=decoder_input_ids,
+                                        max_length=model.decoder.config.max_position_embeddings,
+                                        pad_token_id=processor.tokenizer.pad_token_id,
+                                        eos_token_id=processor.tokenizer.eos_token_id,
+                                        use_cache=True,
+                                        bad_words_ids=[[processor.tokenizer.unk_token_id]],
+                                        return_dict_in_generate=True,)
+            
+                preds = []
+                for seq in processor.tokenizer.batch_decode(outputs.sequences):
+                    seq = seq.replace(processor.tokenizer.eos_token, "").replace(processor.tokenizer.pad_token, "")
+                    seq = re.sub(r"<.*?>", "", seq, count=1).strip()  # remove first task start token
+                    preds.append(seq)
 
-    bar = ProgressBar(config)
+                scores = [compute_edit_distance(pred, ans) for pred, ans in zip(preds, answers[0])]
+                val_scores.extend(scores)
+                val_loss += sum(scores)
 
-    custom_ckpt = CustomCheckpointIO()
-    trainer = pl.Trainer(
-        num_nodes=config.get("num_nodes", 1),
-        devices=torch.cuda.device_count(),
-        strategy="ddp",
-        accelerator="gpu",
-        plugins=custom_ckpt,
-        max_epochs=config.max_epochs,
-        max_steps=config.max_steps,
-        val_check_interval=config.val_check_interval,
-        check_val_every_n_epoch=config.check_val_every_n_epoch,
-        gradient_clip_val=config.gradient_clip_val,
-        precision=16,
-        num_sanity_val_steps=0,
-        logger=logger,
-        callbacks=[lr_callback, checkpoint_callback, bar],
-    )
+                xd += 1
+                if xd == 10:
+                    break # TESTING LOOP
 
-    trainer.fit(model_module, data_module, ckpt_path=config.get("resume_from_checkpoint_path", None))
+        print("V", datetime.datetime.now().time())
+        val_loss /= len(val_loader)
+        print(f"Epoch {epoch+1}/{config['max_epochs']} - Val Loss: {val_loss:.4f}")
 
+        # Save model if it's the best so far
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            model.save_pretrained(result_path)
+            print(f"Model saved to {result_path}")
+
+    print("Training complete!")
+
+
+
+config = {
+    "max_epochs": 2,
+    "k_folds": 5,
+    "lr": 1e-4,
+    "batch_size": 1,
+    "max_length": 768,
+    "pretrained_model_name_or_path": "naver-clova-ix/donut-base-finetuned-cord-v2",
+    "result_path": "result",
+    "seed": 42,
+    "sort_json_key": True,
+    "dataset_name_or_path": "dataset",
+    "task_name": "ocr-pck",
+    "input_size": [1280, 960]
+}
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--exp_version", type=str, required=False)
-    args, left_argv = parser.parse_known_args()
-
-    config = Config(args.config)
-    config.argv_update(left_argv)
-
-    config.exp_name = basename(args.config).split(".")[0]
-    config.exp_version = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") if not args.exp_version else args.exp_version
-
-    save_config_file(config, Path(config.result_path) / config.exp_name / config.exp_version)
     train(config)
