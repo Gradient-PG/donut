@@ -6,13 +6,15 @@ import os
 from pathlib import Path
 import re
 from nltk import edit_distance
-from tqdm import tqdm 
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 from transformers import VisionEncoderDecoderConfig, DonutProcessor, VisionEncoderDecoderModel
 
 from donut_dataset import DonutDataset
 
 import datetime
+import uuid
 
 MODEL_TOKEN_START = "<ocr_pck>"
 MODEL_TOKEN_END = '<ocr_pck/>'
@@ -22,10 +24,30 @@ def compute_edit_distance(pred, answer):
     answer = re.sub(r"<.*?>", "", answer, count=1).replace("</s>", "")
     return edit_distance(pred, answer) / max(len(pred), len(answer))
 
+def log_hparams(writer, config, train_loss, val_loss, val_cer, loop_idx, experiment_id):
+    """Logging hyperparameters and results to TensorBoard."""
+    
+    hparams = {
+        'experiment_id': experiment_id,
+        'batch_size': config["batch_size"],
+        'lr': config["lr"],
+        'max_epochs': config["max_epochs"],
+        'max_length': config["max_length"]
+    }
+    
+    metrics = {
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'val_cer': val_cer
+    }
+    
+    # Log hparams and metrics
+    writer.add_hparams(hparams, metrics, global_step=loop_idx)
+
 
 def train(config):
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     donut_config = VisionEncoderDecoderConfig.from_pretrained(config["pretrained_model_name_or_path"])
@@ -45,7 +67,6 @@ def train(config):
     print("I", datetime.datetime.now().time())
 
     for split in ["train", "validation"]:
-
         print("I - a", datetime.datetime.now().time())
         datasets[split] = DonutDataset(
             model,
@@ -70,7 +91,16 @@ def train(config):
     result_path = Path(config["result_path"])
     result_path.mkdir(parents=True, exist_ok=True)
 
+    # Initialize TensorBoard writer
+    log_dir = result_path / "logs"
+    writer = SummaryWriter(log_dir=str(log_dir))
+
+    # Generate unique experiment ID
+    experiment_id = str(uuid.uuid4())
+
     best_val_loss = float("inf")
+    early_stopping_patience = config["early_stopping_patience"]
+    early_stopping_counter = 0
 
     print("III", datetime.datetime.now().time())
         
@@ -78,7 +108,6 @@ def train(config):
         # --- TRAINING ---
         model.train()
         train_loss = 0
-        xd = 0
         for pixel_values, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['max_epochs']} - Training"):
             pixel_values, labels = pixel_values.to(device), labels.to(device)
 
@@ -89,19 +118,18 @@ def train(config):
             optimizer.step()
             
             train_loss += loss.item()
-            xd += 1
-            if xd == 10:
-                break # TESTING LOOP
         
         train_loss /= len(train_loader)
         print(f"Epoch {epoch+1}/{config['max_epochs']} - Train Loss: {train_loss:.4f}")
+
+        # Log training loss to TensorBoard
+        writer.add_scalar("Loss/Train", train_loss, epoch)
 
         print("IV", datetime.datetime.now().time())
         # --- VALIDATION ---
         model.eval()
         val_loss = 0
         val_scores = []
-        xd = 0
         with torch.no_grad():
             for pixel_values, labels, answers in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['max_epochs']} - Validation"):
                 pixel_values, labels = pixel_values.to(device), labels.to(device)
@@ -111,7 +139,7 @@ def train(config):
 
                 outputs = model.generate(pixel_values,
                                         decoder_input_ids=decoder_input_ids,
-                                        max_length=model.decoder.config.max_position_embeddings,
+                                        max_length=config["max_length"],
                                         pad_token_id=processor.tokenizer.pad_token_id,
                                         eos_token_id=processor.tokenizer.eos_token_id,
                                         use_cache=True,
@@ -124,41 +152,54 @@ def train(config):
                     seq = re.sub(r"<.*?>", "", seq, count=1).strip()  # remove first task start token
                     preds.append(seq)
 
+                if len(preds) != len(answers[0]):
+                    print(f"Warning: Number of predictions ({len(preds)}) does not match number of answers ({len(answers[0])})")
+                    continue
+
                 scores = [compute_edit_distance(pred, ans) for pred, ans in zip(preds, answers[0])]
                 val_scores.extend(scores)
                 val_loss += sum(scores)
 
-                xd += 1
-                if xd == 10:
-                    break # TESTING LOOP
-
         print("V", datetime.datetime.now().time())
         val_loss /= len(val_loader)
-        print(f"Epoch {epoch+1}/{config['max_epochs']} - Val Loss: {val_loss:.4f}")
+        val_cer = np.mean(val_scores)
+        print(f"Epoch {epoch+1}/{config['max_epochs']} - Val Loss: {val_loss:.4f}, Val CER: {val_cer:.4f}")
+
+        # Log validation loss and CER to TensorBoard
+        writer.add_scalar("Loss/Validation", val_loss, epoch)
+        writer.add_scalar("CER/Validation", val_cer, epoch)
 
         # Save model if it's the best so far
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             model.save_pretrained(result_path)
             print(f"Model saved to {result_path}")
+            early_stopping_counter = 0  # reset the counter if we get a new best model
+            log_hparams(writer, config, train_loss, val_loss, val_cer, epoch, experiment_id)
+        else:
+            early_stopping_counter += 1
+            print(f"Early stopping counter: {early_stopping_counter}/{early_stopping_patience}")
 
+        # Check for early stopping
+        if early_stopping_counter >= early_stopping_patience:
+            print("Early stopping triggered")
+            break
+
+    writer.close()
     print("Training complete!")
 
 
-
 config = {
-    "max_epochs": 2,
-    "k_folds": 5,
+    "max_epochs": 20,
     "lr": 1e-4,
-    "batch_size": 1,
-    "max_length": 768,
+    "batch_size": 2,
+    "max_length": 256,
     "pretrained_model_name_or_path": "naver-clova-ix/donut-base-finetuned-cord-v2",
     "result_path": "result",
-    "seed": 42,
-    "sort_json_key": True,
     "dataset_name_or_path": "dataset",
     "task_name": "ocr-pck",
-    "input_size": [1280, 960]
+    "input_size": [1280, 960],
+    "early_stopping_patience": 3
 }
 
 if __name__ == "__main__":
