@@ -140,3 +140,8 @@ dmypy.json
 
 images/*.jpg
 images/aug/*.jpg
+
+logs/*
+new_dataset/*
+new_result/*
+*.out
