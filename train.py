@@ -1,19 +1,13 @@
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
-import random
-import os
 from pathlib import Path
 import re
 from nltk import edit_distance
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-
 from transformers import VisionEncoderDecoderConfig, DonutProcessor, VisionEncoderDecoderModel
-
 from donut_dataset import DonutDataset
-
-import datetime
 import uuid
 
 MODEL_TOKEN_START = "<ocr_pck>"
@@ -61,13 +55,8 @@ def train(config):
     processor.image_processor.do_align_long_axis = False
 
     datasets = {}
-    
-    task_name = config["task_name"]
-
-    print("I", datetime.datetime.now().time())
 
     for split in ["train", "validation"]:
-        print("I - a", datetime.datetime.now().time())
         datasets[split] = DonutDataset(
             model,
             processor,
@@ -77,8 +66,6 @@ def train(config):
             prompt_end_token=MODEL_TOKEN_END,
             sort_json_key=False
         )
-    
-    print("II", datetime.datetime.now().time())
 
     model.config.pad_token_id = processor.tokenizer.pad_token_id
     model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids([MODEL_TOKEN_START])[0]
@@ -88,21 +75,19 @@ def train(config):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
 
-    result_path = Path(config["result_path"])
+    # Generate unique experiment ID
+    experiment_id = str(uuid.uuid4())
+
+    result_path = Path(config["result_path"]) / experiment_id
     result_path.mkdir(parents=True, exist_ok=True)
 
     # Initialize TensorBoard writer
-    log_dir = result_path / "logs"
+    log_dir = "logs"
     writer = SummaryWriter(log_dir=str(log_dir))
-
-    # Generate unique experiment ID
-    experiment_id = str(uuid.uuid4())
 
     best_val_loss = float("inf")
     early_stopping_patience = config["early_stopping_patience"]
     early_stopping_counter = 0
-
-    print("III", datetime.datetime.now().time())
         
     for epoch in range(config["max_epochs"]):
         # --- TRAINING ---
@@ -125,7 +110,6 @@ def train(config):
         # Log training loss to TensorBoard
         writer.add_scalar("Loss/Train", train_loss, epoch)
 
-        print("IV", datetime.datetime.now().time())
         # --- VALIDATION ---
         model.eval()
         val_loss = 0
@@ -160,7 +144,6 @@ def train(config):
                 val_scores.extend(scores)
                 val_loss += sum(scores)
 
-        print("V", datetime.datetime.now().time())
         val_loss /= len(val_loader)
         val_cer = np.mean(val_scores)
         print(f"Epoch {epoch+1}/{config['max_epochs']} - Val Loss: {val_loss:.4f}, Val CER: {val_cer:.4f}")
@@ -189,18 +172,17 @@ def train(config):
     print("Training complete!")
 
 
-config = {
-    "max_epochs": 20,
-    "lr": 1e-4,
-    "batch_size": 2,
-    "max_length": 256,
-    "pretrained_model_name_or_path": "naver-clova-ix/donut-base-finetuned-cord-v2",
-    "result_path": "result",
-    "dataset_name_or_path": "dataset",
-    "task_name": "ocr-pck",
-    "input_size": [1280, 960],
-    "early_stopping_patience": 3
-}
-
 if __name__ == "__main__":
+    config = {
+        "max_epochs": 20,
+        "lr": 1e-4,
+        "batch_size": 2,
+        "max_length": 256,
+        "pretrained_model_name_or_path": "naver-clova-ix/donut-base-finetuned-cord-v2",
+        "result_path": "result",
+        "dataset_name_or_path": "dataset",
+        "input_size": [1280, 960],
+        "early_stopping_patience": 5
+    }
+
     train(config)
